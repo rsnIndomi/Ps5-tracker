@@ -1,0 +1,24 @@
+# systemd unit for running the tracker 24/7 on a Linux box / Raspberry Pi.
+#
+#   sudo cp ps5-tracker.service /etc/systemd/system/
+#   sudo nano /etc/systemd/system/ps5-tracker.service   # set User, paths and NTFY_TOPIC
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ps5-tracker
+#   journalctl -u ps5-tracker -f                        # watch the log
+
+[Unit]
+Description=PS5 Pro stock tracker (ntfy alerts)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/Ps5-tracker
+Environment=NTFY_TOPIC=CHANGE-ME
+Environment=STATE_FILE=/home/pi/Ps5-tracker/state.json
+ExecStart=/usr/bin/python3 /home/pi/Ps5-tracker/tracker.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

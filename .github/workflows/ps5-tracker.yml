@@ -1,0 +1,67 @@
+name: PS5 Pro stock check
+
+# Runs tracker.py --once on a schedule and pushes an ntfy alert when the PS5 Pro is in stock.
+#
+# SAFETY SWITCH: scheduled runs are skipped (and cost nothing) until you create the
+# repository variable TRACKER_ENABLED=true (Settings > Secrets and variables > Actions > Variables).
+# You also need the secret NTFY_TOPIC (and optionally NTFY_TOKEN). See README.md.
+#
+# Costs: in a PUBLIC repo standard runners are free. In a PRIVATE repo every run is billed as at
+# least 1 minute; a */5 schedule is ~8,900 runs/month, far above the 2,000 free minutes of the
+# GitHub Free plan. For a private repo either use loop mode on your own device (recommended) or
+# slow the schedule down (e.g. "*/30 * * * *").
+#
+# GitHub runs schedules on a best-effort basis: runs are often several minutes late and can be
+# skipped when GitHub is busy. Do not rely on this for second-by-second drops.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ps5-tracker
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.event_name == 'workflow_dispatch' || vars.TRACKER_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+      NTFY_SERVER: ${{ vars.NTFY_SERVER }}
+      STATE_FILE: state.json
+      # Each run is one check, so these count runs (roughly 5-15 minutes each), not seconds.
+      ERROR_ALERT_AFTER: "3"
+      REMIND_EVERY: "240"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "::error::Repository secret NTFY_TOPIC is not set. See README.md."
+            exit 1
+          fi
+
+      - name: Restore tracker state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: tracker-state-${{ github.run_id }}
+          restore-keys: tracker-state-
+
+      - name: Check stock
+        run: python3 tracker.py --once
+
+      - name: Save tracker state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: tracker-state-${{ github.run_id }}
