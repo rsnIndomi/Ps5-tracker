@@ -36,6 +36,7 @@ import argparse
 import base64
 import gzip
 import html
+import http.client
 import json
 import os
 import random
@@ -400,8 +401,10 @@ def fetch(url: str, timeout: float = 30.0) -> tuple:
         if exc.code in (403, 429):
             hint = " (blocked or rate-limited by the site; try a longer interval or another network)"
         raise TrackerError(f"HTTP {exc.code} from {url}{hint}") from exc
-    except (urllib.error.URLError, OSError) as exc:  # includes timeouts
+    except (urllib.error.URLError, OSError) as exc:  # includes timeouts and resets
         raise TrackerError(f"network error: {getattr(exc, 'reason', exc)}") from exc
+    except http.client.HTTPException as exc:  # IncompleteRead (truncated body), BadStatusLine, ...
+        raise TrackerError(f"bad HTTP response: {exc!r}") from exc
     try:
         if encoding == "gzip":
             body = gzip.decompress(body)
@@ -412,7 +415,10 @@ def fetch(url: str, timeout: float = 30.0) -> tuple:
                 body = zlib.decompress(body, -zlib.MAX_WBITS)
     except (OSError, zlib.error, EOFError) as exc:
         raise TrackerError(f"could not decompress response: {exc}") from exc
-    return body.decode(charset, errors="replace"), final_url
+    try:
+        return body.decode(charset, errors="replace"), final_url
+    except LookupError:  # unknown charset name in Content-Type
+        return body.decode("utf-8", errors="replace"), final_url
 
 
 def check(url: str, target_skus: Optional[List[str]] = None, timeout: float = 30.0) -> Result:
@@ -427,6 +433,18 @@ def check(url: str, target_skus: Optional[List[str]] = None, timeout: float = 30
 # ntfy
 # --------------------------------------------------------------------------- #
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib would silently turn a redirected POST into a GET (dropping the message)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl} refused - fix NTFY_SERVER",
+                                     headers, fp)
+
+
+_NTFY_OPENER = urllib.request.build_opener(_NoRedirect)
+NTFY_RATE_LIMIT_PAUSE = 15 * 60  # seconds to stop publishing after ntfy answers 429
+
+
 @dataclass
 class Notifier:
     server: str
@@ -435,10 +453,11 @@ class Notifier:
     user: str = ""
     password: str = ""
     dry_run: bool = False
+    blocked_until: float = 0.0
 
     def send(self, title: str, message: str, priority: int = 3, tags: Optional[List[str]] = None,
              click: str = "", action_label: str = "") -> bool:
-        """Publish via ntfy's JSON API. Returns True on success; never raises."""
+        """Publish via ntfy's JSON API. Returns True only if ntfy accepted the message; never raises."""
         payload: Dict[str, Any] = {
             "topic": self.topic,
             "title": title,
@@ -453,31 +472,55 @@ class Notifier:
         if self.dry_run:
             log(f"[dry-run] would notify: {title} - {message}")
             return True
+        if time.time() < self.blocked_until:
+            log(f"ntfy: rate-limited, not sending '{title}' until {datetime.fromtimestamp(self.blocked_until):%H:%M}")
+            return False
         headers = {"Content-Type": "application/json", "User-Agent": f"ps5-pro-tracker/{__version__}"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         elif self.user:
             cred = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
             headers["Authorization"] = f"Basic {cred}"
-        req = urllib.request.Request(
-            self.server.rstrip("/") + "/",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
+        try:
+            req = urllib.request.Request(
+                self.server.rstrip("/") + "/",
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+        except ValueError as exc:
+            log(f"ntfy: invalid server URL {self.server!r}: {exc}")
+            return False
         for attempt in range(3):
+            if attempt:
+                time.sleep(2 * attempt)
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    resp.read()
-                return True
+                with _NTFY_OPENER.open(req, timeout=15) as resp:
+                    body = resp.read()
+                try:
+                    reply = json.loads(body.decode("utf-8", "replace"))
+                except ValueError:
+                    reply = None
+                if isinstance(reply, dict) and reply.get("id"):
+                    return True
+                log(f"ntfy: unexpected reply from {self.server} (is this an ntfy server?): {body[:120]!r}")
+                return False
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", "replace")[:200]
-                log(f"ntfy error HTTP {exc.code}: {detail}")
-                if exc.code < 500 and exc.code != 429:
-                    return False  # auth / bad request: retrying will not help
-            except (urllib.error.URLError, OSError) as exc:
-                log(f"ntfy network error: {getattr(exc, 'reason', exc)}")
-            time.sleep(2 * (attempt + 1))
+                try:
+                    detail = exc.read().decode("utf-8", "replace")[:200]
+                except Exception:  # noqa: BLE001
+                    detail = str(exc.reason)
+                log(f"ntfy error HTTP {exc.code}: {detail or exc.reason}")
+                if exc.code == 429:
+                    self.blocked_until = time.time() + NTFY_RATE_LIMIT_PAUSE
+                    return False
+                if exc.code < 500:
+                    return False  # auth / bad request / redirect: retrying will not help
+            except ValueError as exc:  # e.g. a token containing a newline: configuration, not network
+                log(f"ntfy: invalid request ({exc}) - check NTFY_SERVER / NTFY_TOKEN")
+                return False
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                log(f"ntfy network error: {getattr(exc, 'reason', exc)!r}")
         return False
 
 
@@ -490,6 +533,8 @@ class State:
     status: Optional[str] = None
     detail: str = ""
     last_alert: float = 0.0  # last in-stock / queue alert (epoch seconds)
+    alerts_sent: int = 0  # in-stock / queue alerts sent in the current episode
+    unknown_alerted: str = ""  # reason of the last successfully sent "status changed" alert
     consecutive_errors: int = 0
     error_alert_sent: bool = False
     started_sent: bool = False
@@ -561,8 +606,13 @@ def process(result: Optional[Result], error: Optional[str], state: State, cfg: C
     price = f" for {result.price}" if result.price else ""
     if result.status in (IN_STOCK, QUEUE):
         if prev != result.status:
-            state.last_alert = 0.0  # new episode: alert now (and keep retrying until a send succeeds)
-        if state.last_alert <= 0 or (now - state.last_alert) >= cfg.remind_every:
+            # New episode: alert now (and keep retrying until a send succeeds).
+            state.last_alert = 0.0
+            state.alerts_sent = 0
+        # Reminders back off: remind_every, x2, x4, ... capped at 1 hour, so a long in-stock
+        # period stays far below ntfy.sh's 250 messages/day limit.
+        gap = min(cfg.remind_every * 2 ** min(max(0, state.alerts_sent - 1), 10), max(3600.0, cfg.remind_every))
+        if state.last_alert <= 0 or (now - state.last_alert) >= gap:
             if result.status == IN_STOCK:
                 title = "PS5 Pro IN STOCK!"
                 msg = f"{result.product} is available on PlayStation Direct{price}. Go go go! ({_now_str()})"
@@ -574,15 +624,20 @@ def process(result: Optional[Result], error: Optional[str], state: State, cfg: C
             if notifier.send(title, msg, priority=5, tags=["rotating_light", "video_game"],
                              click=cfg.url, action_label="Open shop"):
                 state.last_alert = now
+                state.alerts_sent += 1
     elif result.status == OUT_OF_STOCK:
         if prev in (IN_STOCK, QUEUE):
             notifier.send("PS5 Pro sold out again", f"{result.product} is out of stock again. ({_now_str()})",
                           priority=2, tags=["x"], click=cfg.url)
     elif result.status == UNKNOWN:
-        if prev != UNKNOWN or state.detail != result.reason:
-            notifier.send("PS5 Pro: stock status changed",
-                          f"Unrecognised stock status on the page ({result.reason}). Have a look - it may be in stock.",
-                          priority=4, tags=["eyes"], click=cfg.url, action_label="Open shop")
+        if state.unknown_alerted != result.reason:
+            if notifier.send("PS5 Pro: stock status changed",
+                             f"Unrecognised stock status on the page ({result.reason}). "
+                             "Have a look - it may be in stock.",
+                             priority=4, tags=["eyes"], click=cfg.url, action_label="Open shop"):
+                state.unknown_alerted = result.reason
+    if result.status != UNKNOWN:
+        state.unknown_alerted = ""
 
     if loop_mode and cfg.start_message and not state.started_sent:
         if notifier.send("PS5 Pro tracker started",
@@ -600,6 +655,9 @@ def run_once(cfg: Config, state: State, notifier: Notifier, loop_mode: bool) -> 
         result = check(cfg.url, cfg.skus or None, timeout=cfg.timeout)
     except TrackerError as exc:
         process(None, str(exc), state, cfg, notifier, time.time(), loop_mode)
+        return None
+    except Exception as exc:  # noqa: BLE001 - one odd response must never stop the tracker
+        process(None, f"unexpected error: {exc!r}", state, cfg, notifier, time.time(), loop_mode)
         return None
     log(result.summary())
     process(result, None, state, cfg, notifier, time.time(), loop_mode)
@@ -629,7 +687,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mode.add_argument("--new-topic", action="store_true", help="print a random ntfy topic name and exit")
     ap.add_argument("--url", default=os.environ.get("PRODUCT_URL") or DEFAULT_URL, help="product page [PRODUCT_URL]")
     ap.add_argument("--sku", action="append", default=None,
-                    help="only watch this SKU id (repeatable; default: the page's own SKU) [TARGET_SKU, comma-separated]")
+                    help="only watch these SKU id(s), comma-separated or repeated (default: the page's own SKU) [TARGET_SKU]")
     ap.add_argument("--topic", default=os.environ.get("NTFY_TOPIC", ""), help="ntfy topic [NTFY_TOPIC]")
     ap.add_argument("--server", default=os.environ.get("NTFY_SERVER") or DEFAULT_NTFY_SERVER,
                     help=f"ntfy server (default {DEFAULT_NTFY_SERVER}) [NTFY_SERVER]")
@@ -660,7 +718,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("ps5pro-" + secrets.token_hex(8))
         return 0
 
-    skus = args.sku if args.sku is not None else [s.strip() for s in os.environ.get("TARGET_SKU", "").split(",") if s.strip()]
+    raw_skus = args.sku if args.sku is not None else [os.environ.get("TARGET_SKU", "")]
+    skus = [s.strip() for value in raw_skus for s in value.split(",") if s.strip()]
     cfg = Config(
         url=args.url.split("#")[0],
         skus=skus,
@@ -671,10 +730,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         start_message=not args.no_start_message,
     )
 
+    if urllib.parse.urlsplit(cfg.url).scheme not in ("http", "https"):
+        print(f"error: product URL must start with https:// (got {cfg.url!r})", file=sys.stderr)
+        return 2
+
     if args.check:
         try:
             result = check(cfg.url, cfg.skus or None, timeout=cfg.timeout)
-        except TrackerError as exc:
+        except Exception as exc:  # noqa: BLE001
             log(f"ERROR: {exc}")
             return 1
         print(f"status : {result.status}")
@@ -698,11 +761,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not NTFY_TOPIC_RE.match(topic):
         print("error: ntfy topic may only contain letters, digits, '-' and '_' (max 64 chars)", file=sys.stderr)
         return 2
-    if len(topic) < 12 and not (args.token or args.user):
+    server = args.server.strip()
+    if "://" not in server:
+        server = "https://" + server
+    server_parts = urllib.parse.urlsplit(server)
+    if server_parts.scheme not in ("http", "https") or not server_parts.netloc:
+        print(f"error: invalid ntfy server {args.server!r} (expected e.g. https://ntfy.sh)", file=sys.stderr)
+        return 2
+    token, user, password = args.token.strip(), args.user.strip(), args.password.strip()
+    if len(topic) < 12 and not (token or user):
         log("warning: short ntfy topics are guessable - anyone who knows the name can read or send to it")
 
-    notifier = Notifier(server=args.server, topic=topic, token=args.token, user=args.user,
-                        password=args.password, dry_run=args.dry_run)
+    notifier = Notifier(server=server, topic=topic, token=token, user=user,
+                        password=password, dry_run=args.dry_run)
 
     if args.test_notify:
         ok = notifier.send("PS5 tracker test", "If you can read this on your phone, ntfy works.",
@@ -710,11 +781,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         log("test notification sent" if ok else "test notification FAILED")
         return 0 if ok else 1
 
-    state = State.load(args.state_file)
+    state_file = args.state_file
+    if args.once and not state_file:
+        # Without remembered state, --once could never send reminders-with-backoff,
+        # "sold out again" or "checks are failing" alerts.
+        state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+    state = State.load(state_file)
 
     if args.once:
         run_once(cfg, state, notifier, loop_mode=False)
-        state.save(args.state_file)
+        state.save(state_file)
         return 0
 
     # Loop mode
@@ -728,11 +804,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _stop)
 
-    log(f"watching {cfg.url} every ~{int(cfg.interval)} s -> ntfy {args.server.rstrip('/')}/{topic}")
+    log(f"watching {cfg.url} every ~{int(cfg.interval)} s -> ntfy {server.rstrip('/')}/{topic}")
     state.started_sent = False  # announce every (re)start, even when state was loaded from a file
     while not stop["flag"]:
-        run_once(cfg, state, notifier, loop_mode=True)
-        state.save(args.state_file)
+        try:
+            run_once(cfg, state, notifier, loop_mode=True)
+        except Exception as exc:  # noqa: BLE001 - last line of defence: keep watching
+            log(f"internal error (continuing): {exc!r}")
+        state.save(state_file)
         # Back off on repeated errors (max 10 min), jitter +-10% so requests are not perfectly periodic.
         backoff = min(2 ** max(0, state.consecutive_errors - 2), 10 * 60 / cfg.interval) if state.consecutive_errors else 1
         delay = cfg.interval * max(1.0, backoff) * random.uniform(0.9, 1.1)

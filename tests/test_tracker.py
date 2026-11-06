@@ -4,13 +4,17 @@ The fixtures are small synthetic pages that mirror the structure of the real
 playstation.com buy-now pages (meta tags, JSON-LD, Next.js RSC payload).
 """
 
+import http.client
+import http.server
 import io
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -264,6 +268,35 @@ class StateMachineTests(unittest.TestCase):
         tracker.process(res(tracker.OUT_OF_STOCK), None, s, cfg(), n, 3, loop_mode=True)
         self.assertEqual(self.titles(n), ["PS5 Pro tracker started"])
 
+    def test_reminders_back_off(self):
+        n, s, c = FakeNotifier(), tracker.State(), cfg(start_message=False, remind_every=300)
+        sent_at = []
+        for t in range(0, 6 * 3600, 60):  # in stock for 6 hours, checked every minute
+            before = len(n.sent)
+            tracker.process(res(tracker.IN_STOCK), None, s, c, n, 1_000_000 + t, loop_mode=True)
+            if len(n.sent) > before:
+                sent_at.append(t)
+        gaps = [b - a for a, b in zip(sent_at, sent_at[1:])]
+        self.assertEqual(gaps[:4], [300, 600, 1200, 2400])
+        self.assertTrue(all(g == 3600 for g in gaps[4:]))
+        self.assertLess(len(sent_at), 12)
+
+    def test_failed_unknown_alert_is_retried(self):
+        n, s, c = FakeNotifier(ok=False), tracker.State(), cfg(start_message=False)
+        tracker.process(res(tracker.UNKNOWN, "odd: X"), None, s, c, n, 1, loop_mode=True)
+        n.ok = True
+        tracker.process(res(tracker.UNKNOWN, "odd: X"), None, s, c, n, 2, loop_mode=True)
+        tracker.process(res(tracker.UNKNOWN, "odd: X"), None, s, c, n, 3, loop_mode=True)
+        self.assertEqual(len(n.sent), 2)  # failed attempt + successful retry, then quiet
+
+    def test_run_once_survives_unexpected_exceptions(self):
+        n, s, c = FakeNotifier(), tracker.State(), cfg(start_message=False, error_alert_after=2)
+        for exc in (http.client.IncompleteRead(b"partial", 1000), LookupError("charset"), RuntimeError("boom")):
+            with mock.patch.object(tracker, "check", side_effect=exc):
+                self.assertIsNone(tracker.run_once(c, s, n, loop_mode=True))
+        self.assertEqual(s.consecutive_errors, 3)
+        self.assertEqual(self.titles(n), ["PS5 tracker: checks are failing"])
+
     def test_state_roundtrip_and_corrupt_file(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "state.json")
@@ -308,6 +341,154 @@ class CliTests(unittest.TestCase):
         code, out, _ = self.run_main(["--test-notify", "--dry-run", "--topic", "https://ntfy.example.com/my-secret-topic-123"])
         self.assertEqual(code, 0)
         self.assertIn("would notify", out)
+
+    def test_invalid_server_rejected_at_startup(self):
+        code, _, err = self.run_main(["--once", "--topic", "my-secret-topic-123", "--server", "ftp://x"])
+        self.assertEqual(code, 2)
+        self.assertIn("server", err)
+
+    def test_server_without_scheme_gets_https(self):
+        with mock.patch.object(tracker.Notifier, "send", autospec=True, return_value=True) as send:
+            code, _, _ = self.run_main(["--test-notify", "--topic", "my-secret-topic-123", "--server", "ntfy.example.com",
+                                        "--token", "tk_abc\n"])
+        self.assertEqual(code, 0)
+        notifier = send.call_args[0][0]
+        self.assertEqual(notifier.server, "https://ntfy.example.com")
+        self.assertEqual(notifier.token, "tk_abc")
+
+    def test_sku_flag_accepts_commas(self):
+        seen = {}
+
+        def fake_check(url, skus, timeout=30):
+            seen["skus"] = skus
+            return tracker.Result(status=tracker.OUT_OF_STOCK)
+
+        with mock.patch.object(tracker, "check", side_effect=fake_check):
+            code, _, _ = self.run_main(["--check", "--sku", "A,B", "--sku", "C"])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["skus"], ["A", "B", "C"])
+
+    def test_once_persists_state_by_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_file = os.path.join(d, "tracker.py")
+            with mock.patch.object(tracker, "__file__", fake_file), \
+                    mock.patch.object(tracker, "check", side_effect=tracker.TrackerError("HTTP 403")):
+                for _ in range(2):
+                    code, _, _ = self.run_main(["--once", "--dry-run", "--topic", "my-secret-topic-123"])
+                    self.assertEqual(code, 0)
+            with open(os.path.join(d, "state.json")) as f:
+                self.assertEqual(json.load(f)["consecutive_errors"], 2)
+
+
+class _Server:
+    """Tiny local HTTP server; `handler(h)` gets the BaseHTTPRequestHandler for each request."""
+
+    def __init__(self, handler):
+        self.requests = []
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):  # silence
+                pass
+
+            def _handle(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                outer.requests.append((self.command, self.path, self.rfile.read(length) if length else b""))
+                handler(self)
+
+            do_GET = do_POST = _handle
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _reply(h, code, body=b"", ctype="application/json", headers=None):
+    h.send_response(code)
+    h.send_header("Content-Type", ctype)
+    for k, v in (headers or {}).items():
+        h.send_header(k, v)
+    h.send_header("Content-Length", str(len(body)))
+    h.end_headers()
+    h.wfile.write(body)
+
+
+class NetworkTests(unittest.TestCase):
+    def setUp(self):
+        self._out = io.StringIO()
+        self._redirect = redirect_stdout(self._out)
+        self._redirect.__enter__()
+        os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+
+    def tearDown(self):
+        self._redirect.__exit__(None, None, None)
+
+    def serve(self, handler):
+        srv = _Server(handler)
+        self.addCleanup(srv.close)
+        return srv
+
+    def test_send_success_requires_ntfy_reply(self):
+        srv = self.serve(lambda h: _reply(h, 200, b'{"id":"abc","event":"message"}'))
+        n = tracker.Notifier(server=srv.url, topic="t-123456789012", token="tk_x")
+        self.assertTrue(n.send("title", "msg €", priority=5, tags=["x"], click="https://e.com", action_label="Open"))
+        method, path, body = srv.requests[0]
+        payload = json.loads(body)
+        self.assertEqual((method, path), ("POST", "/"))
+        self.assertEqual(payload["topic"], "t-123456789012")
+        self.assertEqual(payload["priority"], 5)
+        self.assertEqual(payload["actions"][0]["url"], "https://e.com")
+
+    def test_send_non_ntfy_reply_is_failure(self):
+        srv = self.serve(lambda h: _reply(h, 200, b"<html>login</html>", "text/html"))
+        self.assertFalse(tracker.Notifier(server=srv.url, topic="t").send("a", "b"))
+
+    def test_send_does_not_follow_redirects(self):
+        srv = self.serve(lambda h: _reply(h, 301, headers={"Location": "/elsewhere"}) if h.command == "POST"
+                         else _reply(h, 200, b'{"id":"fake"}'))
+        self.assertFalse(tracker.Notifier(server=srv.url, topic="t").send("a", "b"))
+        self.assertEqual([r[0] for r in srv.requests], ["POST"])  # no follow-up GET
+
+    def test_send_rate_limited_pauses(self):
+        srv = self.serve(lambda h: _reply(h, 429, b'{"code":42908,"error":"limit reached"}'))
+        n = tracker.Notifier(server=srv.url, topic="t")
+        self.assertFalse(n.send("a", "b"))
+        self.assertFalse(n.send("a", "b"))
+        self.assertEqual(len(srv.requests), 1)  # second call did not hit the server
+        self.assertGreater(n.blocked_until, 0)
+
+    def test_send_never_raises_on_bad_config(self):
+        self.assertFalse(tracker.Notifier(server="ntfy.example.com", topic="t").send("a", "b"))
+        srv = self.serve(lambda h: _reply(h, 200, b'{"id":"x"}'))
+        self.assertFalse(tracker.Notifier(server=srv.url, topic="t", token="bad\ntoken").send("a", "b"))
+
+    def test_fetch_truncated_body_is_tracker_error(self):
+        def truncated(h):
+            h.send_response(200)
+            h.send_header("Content-Type", "text/html")
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            h.wfile.write(b"<html>only a bit")
+            h.close_connection = True
+
+        srv = self.serve(truncated)
+        with self.assertRaises(tracker.TrackerError):
+            tracker.fetch(srv.url + "/page", timeout=5)
+
+    def test_fetch_unknown_charset_falls_back_to_utf8(self):
+        srv = self.serve(lambda h: _reply(h, 200, "<html>€</html>".encode(), "text/html; charset=utf-8x"))
+        text, _ = tracker.fetch(srv.url + "/page", timeout=5)
+        self.assertIn("€", text)
+
+    def test_fetch_http_error_is_tracker_error(self):
+        srv = self.serve(lambda h: _reply(h, 403, b"denied", "text/html"))
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            tracker.fetch(srv.url + "/page", timeout=5)
+        self.assertIn("403", str(ctx.exception))
 
 
 if __name__ == "__main__":

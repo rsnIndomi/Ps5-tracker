@@ -16,6 +16,7 @@ User=pi
 WorkingDirectory=/home/pi/Ps5-tracker
 Environment=NTFY_TOPIC=CHANGE-ME
 Environment=STATE_FILE=/home/pi/Ps5-tracker/state.json
+Environment=TZ=Europe/Amsterdam
 ExecStart=/usr/bin/python3 /home/pi/Ps5-tracker/tracker.py
 Restart=always
 RestartSec=30

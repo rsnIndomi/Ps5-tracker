@@ -2,22 +2,27 @@ name: PS5 Pro stock check
 
 # Runs tracker.py --once on a schedule and pushes an ntfy alert when the PS5 Pro is in stock.
 #
-# SAFETY SWITCH: scheduled runs are skipped (and cost nothing) until you create the
-# repository variable TRACKER_ENABLED=true (Settings > Secrets and variables > Actions > Variables).
-# You also need the secret NTFY_TOPIC (and optionally NTFY_TOKEN). See README.md.
+# Setup (see README.md, Option B):
+#   1. Make the repository PUBLIC (standard runners are free there; in a private repo on
+#      GitHub Free this schedule uses up the 2,000 included minutes in about a week, after
+#      which GitHub blocks all runs until the next billing cycle, with no warning push).
+#   2. Secret NTFY_TOPIC (optional: secret NTFY_TOKEN, variable NTFY_SERVER).
+#   3. Variable TRACKER_ENABLED = true. Until then scheduled runs are skipped and cost nothing.
+#   4. Actions > "PS5 Pro stock check" > Run workflow > "test-notify" to get a test push.
 #
-# Costs: in a PUBLIC repo standard runners are free. In a PRIVATE repo every run is billed as at
-# least 1 minute; a */5 schedule is ~8,900 runs/month, far above the 2,000 free minutes of the
-# GitHub Free plan. For a private repo either use loop mode on your own device (recommended) or
-# slow the schedule down (e.g. "*/30 * * * *").
-#
-# GitHub runs schedules on a best-effort basis: runs are often several minutes late and can be
-# skipped when GitHub is busy. Do not rely on this for second-by-second drops.
+# GitHub runs schedules best-effort: often several minutes late, sometimes skipped when busy.
+# The minutes below are offset from :00 because the start of the hour is GitHub's busiest time.
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
   workflow_dispatch:
+    inputs:
+      action:
+        description: "check = normal run | test-notify = send a test push | check-only = show what GitHub's server sees, no ntfy needed"
+        type: choice
+        options: [check, test-notify, check-only]
+        default: check
 
 permissions:
   contents: read
@@ -32,24 +37,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
+      MODE: ${{ github.event_name == 'schedule' && 'check' || inputs.action }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
       NTFY_SERVER: ${{ vars.NTFY_SERVER }}
       STATE_FILE: state.json
-      # Each run is one check, so these count runs (roughly 5-15 minutes each), not seconds.
+      TZ: Europe/Amsterdam
+      # One check per run, so: warn after 3 failed runs in a row.
       ERROR_ALERT_AFTER: "3"
+      # Seconds. Slightly under the 5-minute schedule so the 2nd alert goes out on the next run;
+      # later reminders back off (x2 each time, max 1 per hour).
       REMIND_EVERY: "240"
     steps:
       - uses: actions/checkout@v4
 
+      - name: Show what the tracker sees (no notifications)
+        if: env.MODE == 'check-only'
+        run: python3 tracker.py --check
+
       - name: Check configuration
+        if: env.MODE != 'check-only'
         run: |
           if [ -z "$NTFY_TOPIC" ]; then
-            echo "::error::Repository secret NTFY_TOPIC is not set. See README.md."
+            echo "::error::Repository secret NTFY_TOPIC is not set (Settings > Secrets and variables > Actions)."
             exit 1
           fi
 
+      - name: Send test notification
+        if: env.MODE == 'test-notify'
+        run: python3 tracker.py --test-notify
+
       - name: Restore tracker state
+        if: env.MODE == 'check'
         uses: actions/cache/restore@v4
         with:
           path: state.json
@@ -57,10 +76,11 @@ jobs:
           restore-keys: tracker-state-
 
       - name: Check stock
+        if: env.MODE == 'check'
         run: python3 tracker.py --once
 
       - name: Save tracker state
-        if: always()
+        if: always() && env.MODE == 'check' && hashFiles('state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: state.json

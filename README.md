@@ -9,9 +9,9 @@ PS5 Pro is in stock.
 - Reads the stock status Sony embeds in the page (schema.org `availability` and
   `stockLevelStatus` for the page's own SKU), so it doesn't depend on button text,
   and other consoles shown on the page can't trigger it.
-- Urgent ntfy alert with a tap-to-open "Open shop" button, a reminder every 5 minutes
-  while it stays in stock, a message when it sells out again, and a warning if the
-  tracker itself stops working.
+- Urgent ntfy alert with a tap-to-open "Open shop" button, reminders while it stays in
+  stock (after 5, 10, 20, 40 minutes, then hourly), a message when it sells out again,
+  and a warning if the tracker itself stops working.
 
 ## 1. Set up ntfy (2 minutes)
 
@@ -31,12 +31,15 @@ PS5 Pro is in stock.
 
 ## 2. Run it
 
-### Option A — your own computer, Raspberry Pi or NAS (recommended)
+There are two ways to run it. **Option A** (your own always-on device) gives the fastest
+alerts. **Option B** (GitHub Actions) needs no device, but checks less often.
+
+### Option A — your own computer, Raspberry Pi or NAS
 
 The fastest option: it checks every ~60 seconds, around the clock, as long as the device is on.
 
 ```bash
-git clone https://github.com/rsnIndomi/Ps5-tracker.git && cd Ps5-tracker
+git clone https://github.com/rsnIndomi/Ps5-tracker.git && cd Ps5-tracker   # public repo; otherwise sign in or download the ZIP
 export NTFY_TOPIC=ps5pro-3f9c2a71b0d84e6a
 python3 tracker.py
 ```
@@ -68,30 +71,40 @@ docker logs -f ps5-tracker
 [`.github/workflows/ps5-tracker.yml`](.github/workflows/ps5-tracker.yml) runs one
 check every 5 minutes on GitHub's servers.
 
-1. Repo **Settings → Secrets and variables → Actions**:
-   - *Secrets* tab: add `NTFY_TOPIC` (and `NTFY_TOKEN` if your topic is protected).
-   - *Variables* tab: add `TRACKER_ENABLED` = `true`. Until this exists, scheduled runs are skipped and cost nothing.
-2. **Actions** tab → *PS5 Pro stock check* → *Run workflow* to test it once.
+1. **Make the repo public:** *Settings → General →* (bottom) *Danger Zone → Change
+   visibility → Public*. The repo contains no secrets; your topic lives in an Actions
+   secret, and GitHub masks secrets in the public run logs.
+2. *Settings → Secrets and variables → Actions*:
+   - *Secrets* tab → *New repository secret*: `NTFY_TOPIC` = your topic
+     (and `NTFY_TOKEN` if your topic is protected).
+   - *Variables* tab → *New repository variable*: `TRACKER_ENABLED` = `true`.
+     Until this exists, scheduled runs are skipped and cost nothing.
+3. *Actions* tab → *PS5 Pro stock check* → *Run workflow*, choose **test-notify**:
+   your phone should get a test push. (Choose **check-only** to see what GitHub's server
+   sees on the page; that option doesn't need ntfy.)
 
-Before you rely on it, know the limits:
+From then on it runs every 5 minutes. Know the limits:
 
-- **Private repo = not free at this frequency.** Every run is billed as at least
-  1 minute. A 5-minute schedule is about 8,900 runs a month; the GitHub Free plan
-  includes 2,000 minutes for private repos. Make the repo public (standard runners
-  are free there), slow the schedule down (e.g. `*/30`), or use Option A.
-- **Schedules are best-effort.** Runs are often several minutes late and are
-  sometimes skipped when GitHub is busy.
-- **It may get blocked.** playstation.com runs behind Akamai, which may treat
-  GitHub's data-centre IPs differently from a home connection. This hasn't been
-  tested from GitHub's runners. If checks keep failing you get a "checks are failing"
-  push after 3 failed runs.
-- GitHub may disable scheduled workflows in repos with no activity for 60 days.
+- **Keep the repo public.** In a private repo every run is billed as at least 1 minute.
+  A 5-minute schedule is about 8,900 runs a month, against the 2,000 minutes included in
+  GitHub Free for private repos. Once those run out, GitHub *blocks* all runs until the
+  next billing cycle, and you get no warning push, because the tracker never starts.
+- **Schedules are best-effort.** Runs are often several minutes late and are sometimes
+  skipped when GitHub is busy. Option A is faster.
+- **Blocking:** playstation.com runs behind Akamai, which may treat GitHub's data-centre
+  IPs differently from a home connection. If checks keep failing you get a "checks are
+  failing" push after 3 failed runs.
+- GitHub disables scheduled workflows in public repos after 60 days without activity.
+  It emails you first; re-enable the workflow in the *Actions* tab or push any commit.
+- GitHub's terms describe Actions as being for building, testing and deploying software.
+  Small scheduled checks like this are common, but GitHub can disable workflows it
+  considers misuse.
 
 ## Notifications you can get
 
 | Push | Priority | When |
 |---|---|---|
-| **PS5 Pro IN STOCK!** | urgent (5) | in stock / pre-order; repeated every `REMIND_EVERY` seconds while it lasts |
+| **PS5 Pro IN STOCK!** | urgent (5) | in stock / pre-order; repeated while it lasts (after `REMIND_EVERY`, then doubling, max hourly) |
 | **queue detected – possible drop!** | urgent (5) | the page redirects to a waiting room (Queue-it) |
 | stock status changed | high (4) | Sony uses a stock value the tracker doesn't recognise (have a look) |
 | checks are failing | high (4) | `ERROR_ALERT_AFTER` checks in a row failed (blocked, offline, page redesigned) |
@@ -110,13 +123,15 @@ Every setting can be passed as a flag or an environment variable.
 | `PRODUCT_URL` | `--url` | the PS5 Pro NL page | any playstation.com `buy-now` product page |
 | `TARGET_SKU` | `--sku` | the page's own SKU | watch specific SKU id(s), comma-separated |
 | `CHECK_INTERVAL` | `--interval` | `60` | seconds between checks in loop mode (minimum 20) |
-| `REMIND_EVERY` | `--remind-every` | `300` | repeat the in-stock alert this often while in stock |
+| `REMIND_EVERY` | `--remind-every` | `300` | seconds until the first reminder while in stock; then doubles, max hourly |
 | `ERROR_ALERT_AFTER` | `--error-alert-after` | `10` | failed checks in a row before a warning push |
-| `STATE_FILE` | `--state-file` | – | remember state across restarts / `--once` runs |
+| `STATE_FILE` | `--state-file` | loop: none · `--once`: `state.json` next to `tracker.py` | remember state across restarts / runs |
 | `NO_START_MESSAGE` | `--no-start-message` | off | skip the "tracker started" push |
+| `TZ` | – | system | time zone for the time shown in pushes (Docker image and workflow use `Europe/Amsterdam`) |
 
 Other modes: `--check` (one check, prints what it found, never notifies),
-`--once` (one check with notifications, for cron), `--dry-run` (log instead of sending).
+`--once` (one check with notifications, for cron; remembers state in `state.json`
+so reminders and error warnings work), `--dry-run` (log instead of sending).
 
 ```text
 $ python3 tracker.py --check
@@ -139,7 +154,10 @@ signal : sku PSD001-PSDE01942_39-PS5PROCHASASIRSE-E000K3A7V: OUT_OF_STOCK (inven
   Sony has manually switched the product off rather than simply run out. The tracker
   will notice when that changes, but there's no telling when that will be.
 - If Sony redesigns the page, detection may stop working. You'll get a
-  "checks are failing" push instead of silence.
+  "checks are failing" push instead of silence. The exception: if GitHub itself stops
+  running the workflow (see Option B), nothing runs to warn you.
+- ntfy.sh allows 250 messages a day per IP for free use; the reminder back-off keeps the
+  tracker far below that.
 - It's polite by design: one page request per check (default every 60 s, well above
   the site's `Crawl-delay: 5`), with random jitter and automatic back-off on errors.
 
