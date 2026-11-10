@@ -10,8 +10,10 @@ name: PS5 Pro stock check
 #   3. Variable TRACKER_ENABLED = true. Until then scheduled runs are skipped and cost nothing.
 #   4. Actions > "PS5 Pro stock check" > Run workflow > "test-notify" to get a test push.
 #
-# GitHub runs schedules best-effort: often several minutes late, sometimes skipped when busy.
-# The minutes below are offset from :00 because the start of the hour is GitHub's busiest time.
+# GitHub runs schedules best-effort. For this repo the */5 schedule actually fired only every
+# 4-7 hours, so an external timer (cron-job.org -> workflow_dispatch API, see README) starts the
+# real 5-minute checks; this schedule stays as a backup. Minutes are offset from :00 because the
+# start of the hour is GitHub's busiest time.
 
 on:
   schedule:
@@ -48,6 +50,8 @@ jobs:
       # Seconds. Slightly under the 5-minute schedule so the 2nd alert goes out on the next run;
       # later reminders back off (x2 each time, max 1 per hour).
       REMIND_EVERY: "240"
+      # Daily "still watching" push after this hour (Amsterdam time); set the repo variable to "off" to disable.
+      HEARTBEAT_HOUR: ${{ vars.HEARTBEAT_HOUR || '9' }}
     steps:
       - uses: actions/checkout@v4
 

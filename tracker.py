@@ -538,6 +538,13 @@ class State:
     consecutive_errors: int = 0
     error_alert_sent: bool = False
     started_sent: bool = False
+    # Daily "still watching" summary
+    heartbeat_day: str = ""  # local date (YYYY-MM-DD) of the last summary
+    window_start: float = 0.0  # start of the period the counters below cover
+    window_checks: int = 0
+    window_errors: int = 0
+    last_ok: float = 0.0  # time of the last successful check
+    last_price: str = ""
 
     @classmethod
     def load(cls, path: str) -> "State":
@@ -573,15 +580,72 @@ class Config:
     error_alert_after: int
     timeout: float
     start_message: bool
+    heartbeat_hour: Optional[int] = None  # local hour for the daily summary; None = off
 
 
 def _now_str() -> str:
     return datetime.now().astimezone().strftime("%H:%M:%S")
 
 
+STATUS_LABEL = {IN_STOCK: "IN STOCK", OUT_OF_STOCK: "out of stock", UNKNOWN: "unclear", QUEUE: "queue"}
+
+
 def process(result: Optional[Result], error: Optional[str], state: State, cfg: Config,
             notifier: Notifier, now: float, loop_mode: bool) -> None:
     """Update state for one check and send whatever notifications are due."""
+    if state.window_start <= 0:
+        state.window_start = now
+    state.window_checks += 1
+    if error is not None:
+        state.window_errors += 1
+    else:
+        state.last_ok = now
+        if result is not None and result.price:
+            state.last_price = result.price
+    _process_check(result, error, state, cfg, notifier, now, loop_mode)
+    maybe_send_heartbeat(state, cfg, notifier, now)
+
+
+def maybe_send_heartbeat(state: State, cfg: Config, notifier: Notifier, now: float) -> None:
+    """Once a day (first check after `heartbeat_hour`), push a summary proving the tracker runs.
+
+    The number of checks shows at a glance whether the schedule is really running often enough.
+    """
+    if cfg.heartbeat_hour is None:
+        return
+    local = datetime.fromtimestamp(now)
+    today = local.strftime("%Y-%m-%d")
+    if not state.heartbeat_day:
+        state.heartbeat_day = today  # first run ever: start counting, first summary tomorrow
+        return
+    if state.heartbeat_day == today or local.hour < cfg.heartbeat_hour:
+        return
+
+    hours = max(0.0, now - state.window_start) / 3600
+    checks, errors = state.window_checks, state.window_errors
+    gap_min = hours * 60 / checks if checks else 0
+    if state.last_ok:
+        last = (f"Last good check {datetime.fromtimestamp(state.last_ok):%a %H:%M}: "
+                f"{STATUS_LABEL.get(state.status or '', state.status or '?')}"
+                + (f", {state.last_price}" if state.last_price else "") + ".")
+    else:
+        last = "No successful check in this period."
+    msg = (f"{checks} checks in the last {hours:.0f} h ({errors} failed), "
+           f"about every {gap_min:.0f} min. {last}")
+    sparse = gap_min > 30
+    if sparse:
+        msg += ("\nThat is too slow to catch a drop: GitHub is probably throttling the schedule. "
+                "Check the external timer (README, Option B).")
+    if notifier.send("PS5 tracker: still watching", msg, priority=3 if sparse or errors else 2,
+                     tags=["warning" if sparse else "white_check_mark"]):
+        state.heartbeat_day = today
+        state.window_start = now
+        state.window_checks = 0
+        state.window_errors = 0
+
+
+def _process_check(result: Optional[Result], error: Optional[str], state: State, cfg: Config,
+                   notifier: Notifier, now: float, loop_mode: bool) -> None:
     if error is not None:
         state.consecutive_errors += 1
         log(f"check failed ({state.consecutive_errors}x in a row): {error}")
@@ -706,6 +770,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-start-message", action="store_true",
                     default=os.environ.get("NO_START_MESSAGE", "").lower() in ("1", "true", "yes"),
                     help="loop mode: do not send the 'tracker started' notification [NO_START_MESSAGE]")
+    ap.add_argument("--heartbeat-hour", default=os.environ.get("HEARTBEAT_HOUR") or "9",
+                    help="local hour (0-23) for the daily 'still watching' summary, or 'off' (default 9) [HEARTBEAT_HOUR]")
     ap.add_argument("--dry-run", action="store_true", help="log notifications instead of sending them")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return ap
@@ -720,6 +786,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     raw_skus = args.sku if args.sku is not None else [os.environ.get("TARGET_SKU", "")]
     skus = [s.strip() for value in raw_skus for s in value.split(",") if s.strip()]
+    hb = str(args.heartbeat_hour).strip().lower()
+    if hb in ("off", "none", "no", "false", "-1", ""):
+        heartbeat_hour = None
+    elif hb.isdigit() and 0 <= int(hb) <= 23:
+        heartbeat_hour = int(hb)
+    else:
+        print(f"error: --heartbeat-hour must be 0-23 or 'off' (got {args.heartbeat_hour!r})", file=sys.stderr)
+        return 2
     cfg = Config(
         url=args.url.split("#")[0],
         skus=skus,
@@ -728,6 +802,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         error_alert_after=max(1, args.error_alert_after),
         timeout=max(5.0, args.timeout),
         start_message=not args.no_start_message,
+        heartbeat_hour=heartbeat_hour,
     )
 
     if urllib.parse.urlsplit(cfg.url).scheme not in ("http", "https"):

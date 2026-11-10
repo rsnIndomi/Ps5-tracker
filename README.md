@@ -83,7 +83,54 @@ check every 5 minutes on GitHub's servers.
    your phone should get a test push. (Choose **check-only** to see what GitHub's server
    sees on the page; that option doesn't need ntfy.)
 
-From then on it runs every 5 minutes. Know the limits:
+4. **Add an external timer (needed).** GitHub's own schedule asks for every 5 minutes,
+   but in practice this repo was started only every **4–7 hours**. Manual starts
+   (`workflow_dispatch`) run within seconds, so a free timer service starts the workflow
+   every 5 minutes instead:
+
+   1. **Create a GitHub token** that can only start workflows in this repo:
+      GitHub → *Settings → Developer settings → Personal access tokens → Fine-grained tokens →
+      Generate new token*.
+      - *Token name*: `ps5-tracker timer`
+      - *Expiration*: the longest offered (put a reminder in your calendar to renew it)
+      - *Repository access*: *Only select repositories* → `Ps5-tracker`
+      - *Permissions → Repository permissions → Actions*: **Read and write**. Leave everything else at *No access*.
+      - Copy the token (starts with `github_pat_`). GitHub shows it only once.
+   2. **Create a free account at [cron-job.org](https://cron-job.org)** → *Create cronjob*:
+      - *URL*: `https://api.github.com/repos/rsnIndomi/Ps5-tracker/actions/workflows/ps5-tracker.yml/dispatches`
+      - *Execution schedule*: every **5** minutes
+      - *Advanced* tab → *Request method*: `POST`
+      - *Headers* (add four):
+        `Authorization` = `Bearer github_pat_…` (your token) ·
+        `Accept` = `application/vnd.github+json` ·
+        `X-GitHub-Api-Version` = `2022-11-28` ·
+        `Content-Type` = `application/json`
+      - *Request body*: `{"ref":"main"}`
+      - Turn on *Notify me when execution fails*, then save.
+   3. Click *Test run* in cron-job.org. A good answer is **HTTP 204** (empty), and a new
+      run appears in the *Actions* tab within seconds. `401`/`403` means the token or its
+      permission is wrong; `404` means a typo in the URL.
+
+   The token can only manage workflow runs in this one repo (start, cancel, re-run, delete
+   runs and logs). It can't read or change your code or secrets, so the risk if cron-job.org
+   leaked it is small. You can revoke it on GitHub at any time.
+
+### How do I know it's working?
+
+- **Every morning after 09:00 you get a low-priority push "still watching"**, e.g.
+  *"287 checks in the last 24 h (0 failed), about every 5 min. Last good check Tue 09:01:
+  out of stock, €899,99."*
+  - About **280–290 checks**: everything works.
+  - **Only a handful, "too slow" warning**: the external timer isn't running (check cron-job.org).
+  - **No morning push at all**: nothing is running. Look at the *Actions* tab.
+- If checks start **failing** (blocked, page changed), you get "checks are failing"
+  after 3 failed runs in a row, without waiting for the morning.
+- cron-job.org emails you if it can't start the workflow (e.g. the token expired).
+- Any time: the *Actions* tab lists every run; a green tick means the page was checked.
+
+Change the time with the repository variable `HEARTBEAT_HOUR` (0–23), or set it to `off`.
+
+Know the limits:
 
 - **Keep the repo public.** In a private repo every run is billed as at least 1 minute.
   A 5-minute schedule is about 8,900 runs a month, against the 2,000 minutes included in
@@ -108,6 +155,7 @@ From then on it runs every 5 minutes. Know the limits:
 | **queue detected – possible drop!** | urgent (5) | the page redirects to a waiting room (Queue-it) |
 | stock status changed | high (4) | Sony uses a stock value the tracker doesn't recognise (have a look) |
 | checks are failing | high (4) | `ERROR_ALERT_AFTER` checks in a row failed (blocked, offline, page redesigned) |
+| still watching | low (2); default (3) if checks were too far apart or some failed | once a day after `HEARTBEAT_HOUR` (default 09:00): number of checks in the last 24 h |
 | sold out again / working again / tracker started | low (2) | for context |
 
 ## Configuration
@@ -127,6 +175,7 @@ Every setting can be passed as a flag or an environment variable.
 | `ERROR_ALERT_AFTER` | `--error-alert-after` | `10` | failed checks in a row before a warning push |
 | `STATE_FILE` | `--state-file` | loop: none · `--once`: `state.json` next to `tracker.py` | remember state across restarts / runs |
 | `NO_START_MESSAGE` | `--no-start-message` | off | skip the "tracker started" push |
+| `HEARTBEAT_HOUR` | `--heartbeat-hour` | `9` | local hour for the daily "still watching" push, or `off` |
 | `TZ` | – | system | time zone for the time shown in pushes (Docker image and workflow use `Europe/Amsterdam`) |
 
 Other modes: `--check` (one check, prints what it found, never notifies),

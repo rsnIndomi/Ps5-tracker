@@ -297,6 +297,49 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(s.consecutive_errors, 3)
         self.assertEqual(self.titles(n), ["PS5 tracker: checks are failing"])
 
+    def test_heartbeat_daily_summary(self):
+        from datetime import datetime as dt
+        n, s, c = FakeNotifier(), tracker.State(), cfg(start_message=False, heartbeat_hour=9)
+        t0 = dt(2026, 11, 10, 9, 30).timestamp()
+        tracker.process(res(tracker.OUT_OF_STOCK), None, s, c, n, t0, loop_mode=False)
+        self.assertEqual(n.sent, [])  # first run ever only starts counting
+        for i in range(1, 282):  # every 5 minutes until 08:55 the next day, one failure
+            err = "HTTP 503" if i == 100 else None
+            tracker.process(None if err else res(tracker.OUT_OF_STOCK), err, s, c, n, t0 + i * 300, loop_mode=False)
+        self.assertEqual(n.sent, [])  # next day, but before 09:00
+        tracker.process(res(tracker.OUT_OF_STOCK), None, s, c, n, dt(2026, 11, 11, 9, 1).timestamp(), loop_mode=False)
+        self.assertEqual(self.titles(n), ["PS5 tracker: still watching"])
+        msg = n.sent[0]["message"]
+        self.assertIn("283 checks", msg)
+        self.assertIn("(1 failed)", msg)
+        self.assertIn("about every 5 min", msg)
+        self.assertIn("out of stock, €899,99", msg)
+        self.assertNotIn("too slow", msg)
+        self.assertEqual(s.window_checks, 0)  # counters reset after a successful summary
+        tracker.process(res(tracker.OUT_OF_STOCK), None, s, c, n, dt(2026, 11, 11, 9, 6).timestamp(), loop_mode=False)
+        self.assertEqual(len(n.sent), 1)  # only once per day
+
+    def test_heartbeat_warns_when_checks_are_sparse_and_retries(self):
+        from datetime import datetime as dt
+        n, s, c = FakeNotifier(ok=False), tracker.State(), cfg(start_message=False, heartbeat_hour=9)
+        for t in (dt(2026, 11, 10, 10, 0), dt(2026, 11, 10, 15, 0), dt(2026, 11, 10, 20, 0),
+                  dt(2026, 11, 11, 2, 0), dt(2026, 11, 11, 9, 30)):
+            tracker.process(res(tracker.OUT_OF_STOCK), None, s, c, n, t.timestamp(), loop_mode=False)
+        self.assertEqual(len(n.sent), 1)  # attempted, but the send failed
+        self.assertIn("too slow", n.sent[0]["message"])
+        self.assertEqual(n.sent[0]["priority"], 3)
+        n.ok = True
+        tracker.process(res(tracker.OUT_OF_STOCK), None, s, c, n, dt(2026, 11, 11, 14, 0).timestamp(), loop_mode=False)
+        self.assertEqual(len(n.sent), 2)  # retried on the next run
+        self.assertEqual(s.heartbeat_day, "2026-11-11")
+
+    def test_heartbeat_off(self):
+        from datetime import datetime as dt
+        n, s, c = FakeNotifier(), tracker.State(), cfg(start_message=False, heartbeat_hour=None)
+        for day in (10, 11, 12):
+            tracker.process(res(tracker.OUT_OF_STOCK), None, s, c, n, dt(2026, 11, day, 12, 0).timestamp(), loop_mode=False)
+        self.assertEqual(n.sent, [])
+
     def test_state_roundtrip_and_corrupt_file(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "state.json")
@@ -341,6 +384,11 @@ class CliTests(unittest.TestCase):
         code, out, _ = self.run_main(["--test-notify", "--dry-run", "--topic", "https://ntfy.example.com/my-secret-topic-123"])
         self.assertEqual(code, 0)
         self.assertIn("would notify", out)
+
+    def test_heartbeat_hour_validation(self):
+        code, _, err = self.run_main(["--once", "--topic", "my-secret-topic-123", "--heartbeat-hour", "25"])
+        self.assertEqual(code, 2)
+        self.assertIn("heartbeat", err)
 
     def test_invalid_server_rejected_at_startup(self):
         code, _, err = self.run_main(["--once", "--topic", "my-secret-topic-123", "--server", "ftp://x"])
